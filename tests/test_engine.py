@@ -194,3 +194,8 @@ def test_train_and_eval_scripts(camvid_root, tmp_path):
         assert results["method"] == method and 0.0 <= results["acc"] <= 1.0
         assert os.path.exists(os.path.join(out, f"calibration_{method}.png"))
     assert "method" in stdout
+
+    bench = os.path.join(out, "bench.json")
+    stdout = run_script("scripts/benchmark_stream.py", "--ckpt", ckpt, "--frames", "4", "--warmup", "1", "--out", bench, *common)
+    with open(bench) as f:
+        assert set(json.load(f)["results"]) == {"dnn", "mc", "vq"}

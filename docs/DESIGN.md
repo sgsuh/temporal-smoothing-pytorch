@@ -237,3 +237,14 @@ class EMASmoother:
 6. `engine/`, `scripts/`, configs
 7. README (설치·데이터 준비·사용법), CamVid 재현 실험
 8. (추후) depth estimation, Gaussian smoothing 경로
+
+## 8. 재현 결과 요약
+
+전체 표는 README의 Results 참고 (CamVid-11 test, 시드 1개, RTX 4070 Laptop).
+
+- U-Net VQ-BNN: NLL 0.293 / Acc 91.1 / Acc-90 97.1 / Unc-90 73.3 / ECE 2.47, 스트리밍 30.6 fps
+  (논문 0.253 / 92.0 / 97.4 / 72.4 / 2.24). MC 30회 BNN(0.312, ECE 3.85, 1.1 fps)보다 모든 지표가 좋고 ~29배 빠르다.
+- 4개 모델 모두에서 smoothing이 단일 forward 대비 NLL, ECE, Acc-90, Unc-90을 개선. 스트리밍 처리량은 DNN의 96~97%.
+- 논문과의 차이: U-Net NLL이 0.03~0.04 높음. 학습 중 val 지표가 크게 출렁임 (예: val NLL 0.22 → 0.87 → 0.22) —
+  batch 3 + Keras BN momentum 조합으로 추정. 최종 epoch 체크포인트를 그대로 사용.
+- SegNet(원본처럼 사전학습 없이 학습)은 test에서 약함 (Acc 80~84%, val은 86~89%).
