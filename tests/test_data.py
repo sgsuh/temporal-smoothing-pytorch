@@ -235,3 +235,19 @@ def test_real_camvid_class_weights_rank_matches_memorized():
     memorized = memorized_class_weights("camvid-11")
     assert torch.equal(weights.argsort(), memorized.argsort())
     assert weights[8] == pytest.approx(1.0)  # Car is the median class
+
+
+@pytest.mark.skipif(not os.path.isdir(os.path.join(CAMVID_ROOT, "seq")), reason="CamVid sequence frames not available")
+def test_real_camvid_sequence_windows_contain_labeled_frame():
+    past, future = 5, 2
+    windows = camvid_sequence(CAMVID_ROOT, past=past, future=future)
+    stills = CamVid(CAMVID_ROOT, "test")
+    assert len(windows) == len(stills) == 232
+    for i in (0, 100, 231):
+        frames, label = windows[i]
+        image, still_label = stills[i]
+        assert frames.shape == (past + future + 1, 3, 360, 480)
+        assert torch.equal(label, still_label)
+        # The current frame is the video frame of the still (up to YUV -> RGB conversion).
+        assert (frames[past] - image).abs().mean() < 2 / 255
+        assert (frames[past - 1] - image).abs().mean() > (frames[past] - image).abs().mean()

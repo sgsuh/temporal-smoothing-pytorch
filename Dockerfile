@@ -7,6 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /workspace
 
+# ffmpeg decodes the CamVid videos (Lagarith AVI, DVCPRO HD MXF) for frame extraction.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies (and the package in editable mode) from a minimal copy of the
 # sources so that this layer is cached until pyproject.toml changes. The full source
 # tree is bind-mounted at /workspace at runtime (see docker-compose.yml).

@@ -22,6 +22,15 @@ Datasets are mounted from `DATA_ROOT` (set in `.env`, see `.env.example`) at `/d
 CamVid is expected at `$DATA_ROOT/CamVid` with `train`, `val`, `test` and `*_labels`
 directories; tests that need the real dataset are skipped when it is absent.
 
+Temporal smoothing additionally needs the 30 Hz frames around the labeled test frames.
+Download the original videos from the [CamVid mirror](http://vis.cs.ucl.ac.uk/Download/G.Brostow/CamVid/)
+(`01TP_extract.avi`, `0006R0.MXF`, `0005VD.MXF`, `0016E5.zip.001`, `0016E5.zip.002`) into
+`$DATA_ROOT/CamVid/videos`, then extract and verify the frames:
+
+```bash
+docker compose run --rm dev python scripts/prepare_camvid_seq.py --past 5 --future 2
+```
+
 ## Usage
 
 ```python
