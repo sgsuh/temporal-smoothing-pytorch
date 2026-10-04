@@ -6,7 +6,9 @@ dist/
 .pytest_cache/
 .ipynb_checkpoints/
 
-datasets/
+datasets/*
+!datasets/.gitkeep
+.env
 checkpoints/
 logs/
 runs/

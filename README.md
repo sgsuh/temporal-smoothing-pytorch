@@ -18,6 +18,10 @@ docker compose run --rm dev                # interactive shell
 The repository is bind-mounted at `/workspace`, and the container runs as the host user
 (`HOST_UID`/`HOST_GID`, default `1000`).
 
+Datasets are mounted from `DATA_ROOT` (set in `.env`, see `.env.example`) at `/data`.
+CamVid is expected at `$DATA_ROOT/CamVid` with `train`, `val`, `test` and `*_labels`
+directories; tests that need the real dataset are skipped when it is absent.
+
 ## Usage
 
 ```python

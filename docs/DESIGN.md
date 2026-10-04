@@ -11,7 +11,7 @@ Reference implementation: [xxxnell/temporal-smoothing](https://github.com/xxxnel
 | smoothing 코어 (window / stream / EMA) | Depth estimation (NYUDv2) |
 | Predictor: DNN, MC(BNN), temp scaling, VQ, ensemble, ensemble smoothing | UCI 분류 (Flipout BNN, OCH 기반 일반 VQ-BNN — 원본에도 미공개) |
 | U-Net, SegNet (+ MC dropout) | Simple linear regression 시각화 노트북 |
-| CamVid-11 / CamVid-31 / Cityscapes 데이터셋 + 시퀀스 윈도우 | |
+| CamVid-11 / CamVid-31 데이터셋 + 시퀀스 윈도우 | Cityscapes (sequence 패키지 수백 GB, 학습 비용 큼) |
 | 세그멘테이션 지표, reliability diagram, 학습/평가 스크립트 | |
 
 `smoothing.py`는 Gaussian(moment matching) 버전까지 포함해 depth 확장 시 재사용한다.
@@ -47,9 +47,9 @@ temporal_smoothing/
     segnet.py
   data/
     __init__.py
-    labels.py          # CamVid / Cityscapes Label 테이블, color→index 매핑
+    labels.py          # CamVid Label 테이블, color→index 매핑, memorized class weights
     camvid.py
-    cityscapes.py
+    weights.py         # median frequency balancing
     sequence.py        # SequenceWindowDataset
     transforms.py
   metrics/
@@ -64,7 +64,7 @@ scripts/
   train_seg.py
   eval_seg.py
 configs/
-  camvid_unet_bnn.yaml, camvid_unet_dnn.yaml, camvid_segnet_bnn.yaml, cityscapes_unet_bnn.yaml ...
+  camvid_unet_bnn.yaml, camvid_unet_dnn.yaml, camvid_segnet_bnn.yaml ...
 tests/
 ```
 
@@ -134,17 +134,41 @@ class EMASmoother:
 
 ### 4.4 `data/`
 
-- `labels.py`: 원본 `camvid_labels`, `cityscape_labels` 테이블 이식. `color_map(name) -> dict[rgb, index]`
-  - `camvid` / `camvid-11`: category 기준 11 클래스, `camvid-31`: 원 라벨, `cityscapes`: trainId 19 클래스
-  - void / ignore → `-1` (loss·지표에서 마스킹)
-- 전처리 (원본 일치): PIL 로드 → **nearest** 리사이즈 (CamVid 360×480, Cityscapes 512×1024) → `/255` (정규화 없음).
-  학습 augmentation: random crop (CamVid 기본은 이미지 크기 = 사실상 없음), flip (기본 off).
-- `CamVid(root, split, ...)`, `Cityscapes(root, split, ...)`: `(image[3,H,W] float, label[H,W] long)`.
-  Cityscapes는 원본처럼 `val`을 test로 사용한다.
-- `SequenceWindowDataset(frames, labels, past, future)`:
-  - 라벨이 있는 프레임마다 `(frames[T,3,H,W], label[H,W])`.
-  - 시퀀스 ID(CamVid: `0001TP` 등 prefix, Cityscapes: `city_seq`)로 그룹핑해서 **윈도우가 시퀀스를 넘지 않게** 한다. 넘는 경우 `boundary="clamp"`(가장자리 프레임 반복, 기본) / `"skip"` / `"legacy"`(원본처럼 경계 무시).
-- 데이터 준비: CamVid 시퀀스 프레임(30fps 영상 → `{seq}_{frame:06d}.png`)과 Cityscapes `leftImg8bit_sequence`는 사용자가 직접 받는다. 디렉터리 규약은 원본과 같게 하고, README에 준비 방법을 적는다.
+데이터셋은 CamVid만 지원한다 (Cityscapes는 범위 밖). 시퀀스 윈도우는 데이터셋과 무관하게 구현해 확장 가능하게 둔다.
+
+- 디렉터리 (SegNet/Kaggle 701장 배포판): `root/{train,val,test}{,_labels}/`, 라벨은 `{seq}_{frame}_L.png` RGB 컬러.
+  train 369 / val 100 / test 232. 프레임 번호는 `006690` 또는 `f05100` 형식 (`parse_camvid_name`).
+- `labels.py`: 원본 `camvid_labels` 테이블 이식. `color_map(name) -> dict[rgb, index]`
+  - `camvid` / `camvid-11`: category 기준 11 클래스 (index = categoryId - 1), `camvid-31`: void 제외 원 라벨 31개 (테이블 순서)
+  - 테이블에 없는 색 (Void, 압축 노이즈 ~200픽셀) → `-1`
+- 전처리 (원본 일치): RGB 로드 → `nearest-exact` 리사이즈 360×480 (TF2 `resize(NEAREST)`와 같은 픽셀 중심 샘플링) → `/255` (정규화 없음).
+  컬러 라벨은 리사이즈 후 index로 변환. 학습 augmentation: `random_crop_flip` (원본 CamVid 기본은 둘 다 사실상 없음).
+- `CamVid(root, split, name, size, crop_size, flip)`: `(image[3,H,W] float, label[H,W] long)`.
+- `SequenceWindowDataset(frames, labels, load_frame, load_label, past, future, boundary)`:
+  - 라벨 프레임마다 `(frames[T,3,H,W], label[H,W])`. 이웃은 시퀀스 내 정렬된 프레임 목록의 위치 기준.
+  - 시퀀스 경계: `boundary="clamp"`(가장자리 프레임 반복, 기본) / `"skip"` / `"legacy"`(원본처럼 전체 파일 목록 기준, 시퀀스 무시).
+  - 라벨 프레임이 프레임 목록에 없으면 건너뛰고 경고.
+- `camvid_sequence(root, seq_dir=root/seq, ...)`: test 라벨 + 연속 프레임 디렉터리로 `SequenceWindowDataset` 생성.
+- class weights: 원본 memorized 값(`memorized_class_weights`)이 기본. `median_frequency_weights`로 직접 계산 가능.
+  실제 CamVid train에서 계산한 값은 memorized와 클래스 순위·median 클래스(Car)는 같지만 값이 5~20% 다르다
+  (train/val/test 어느 조합과도 정확히 일치하지 않음 → 원본은 다른 데이터 버전에서 계산된 것으로 추정).
+- 데이터 마운트: `.env`의 `DATA_ROOT`를 컨테이너 `/data`로 마운트, `CAMVID_ROOT=/data/CamVid`. 실데이터 테스트는 경로가 없으면 skip.
+
+#### 연속 프레임 (VQ 평가용)
+
+701장 배포판에는 30Hz 연속 프레임이 없다. 원본 영상에서 추출해야 한다.
+
+| 시퀀스 | 영상 | test 라벨 프레임 범위 (30프레임 간격) |
+|---|---|---|
+| 0001TP | `01TP_extract.avi` (1.65 GB) | 6690 – 10260 |
+| 0006R0 | `0006R0.MXF` (1.68 GB) | 990 – 3780 |
+| 0016E5 | `0016E5.zip.001/.002` (2.54 GB) | 420 – 8580 |
+| Seq05VD | `0005VD.MXF` (1.55 GB) | 240 – 5070 |
+
+- 출처: http://vis.cs.ucl.ac.uk/Download/G.Brostow/CamVid/ (원 공식 FTP는 접속 불가). MXF는 Panasonic P2 (DVCPRO HD) 코덱.
+- 영상 프레임 번호 ↔ 라벨 프레임 번호의 오프셋은 추출한 프레임을 라벨 이미지와 픽셀 비교해서 확정한다
+  (0001TP는 `0001TP_v01_06690_10380` 표기로 보아 6690부터 시작하는 extract로 추정).
+- 추출은 ffmpeg 컨테이너에서 수행하고, 결과는 `CamVid/seq/{seq}_{frame}.png` (라벨과 같은 번호 형식).
 
 ### 4.5 `metrics/`
 
@@ -165,9 +189,9 @@ class EMASmoother:
 - `train_one_epoch(model, loader, optimizer, class_weights, loss_reduction="mean")`:
   - weighted CE, `ignore_index=-1`. 원본은 사실상 `sum`이고 Adam은 스케일에 거의 불변이므로 기본은 `mean`, `"sum"` 옵션을 둔다.
   - `model.train()` (BN 학습 모드, MCDropout 항상 on).
-- class weights: 원본의 memorized median-frequency 값을 이식하고 `compute_median_freq_weights(dataset)`도 제공한다.
+- class weights: 기본은 memorized median-frequency 값, 옵션으로 `median_frequency_weights(dataset)`.
 - `evaluate(predictor, loader, meter)` + 추론 시간 측정. CUDA면 `synchronize` 후 측정한다.
-- 기본 하이퍼파라미터: Adam(lr 1e-3, β=(0.9, 0.999)), batch 3, CamVid 100 epoch / Cityscapes 500 epoch, rate 0.5, MC 30 samples, K=5, J=0, τ=1.25.
+- 기본 하이퍼파라미터: Adam(lr 1e-3, β=(0.9, 0.999)), batch 3, CamVid 100 epoch, rate 0.5, MC 30 samples, K=5, J=0, τ=1.25.
 - `scripts/train_seg.py --config configs/camvid_unet_bnn.yaml`, `scripts/eval_seg.py --config ... --ckpt ... --method {dnn,mc,vq,temp,ensemble,ensemble_vq}`
 - 설정은 yaml → dataclass. CLI 인자로 덮어쓸 수 있다. 로깅은 TensorBoard(선택) + stdout.
 - 재현성: `seed` 설정, `torch.Generator` 전달.
@@ -198,7 +222,7 @@ class EMASmoother:
 2. `nn/` (MCDropout, UNet, SegNet) + shape 테스트
 3. `predictors.py` + 테스트
 4. `metrics/` + numpy 기준 테스트
-5. `data/` (labels, CamVid, Cityscapes, SequenceWindowDataset)
+5. `data/` (labels, CamVid, SequenceWindowDataset), 연속 프레임 추출
 6. `engine/`, `scripts/`, configs
 7. README (설치·데이터 준비·사용법), CamVid 재현 실험
 8. (추후) depth estimation, Gaussian smoothing 경로
