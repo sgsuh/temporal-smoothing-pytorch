@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+datasets/*
+!datasets/.gitkeep
+.env
+checkpoints/
+logs/
+runs/

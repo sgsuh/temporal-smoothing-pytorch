@@ -1,0 +1,250 @@
+# Design: temporal-smoothing-pytorch
+
+PyTorch implementation of **VQ-BNN / temporal smoothing**
+(Park, Lee, Kim. *Vector Quantized Bayesian Neural Network Inference for Data Streams*, AAAI 2021, [arXiv:1907.05911](https://arxiv.org/abs/1907.05911)).
+Reference implementation: [xxxnell/temporal-smoothing](https://github.com/xxxnell/temporal-smoothing) (TensorFlow 2.0).
+
+## 1. 범위
+
+| 포함 (1차) | 제외 (추후) |
+|---|---|
+| smoothing 코어 (window / stream / EMA) | Depth estimation (NYUDv2) |
+| Predictor: DNN, MC(BNN), temp scaling, VQ, ensemble, ensemble smoothing | UCI 분류 (Flipout BNN, OCH 기반 일반 VQ-BNN — 원본에도 미공개) |
+| U-Net, SegNet (+ MC dropout) | Simple linear regression 시각화 노트북 |
+| CamVid-11 / CamVid-31 데이터셋 + 시퀀스 윈도우 | Cityscapes (sequence 패키지 수백 GB, 학습 비용 큼) |
+| 세그멘테이션 지표, reliability diagram, 학습/평가 스크립트 | |
+
+`smoothing.py`는 Gaussian(moment matching) 버전까지 포함해 depth 확장 시 재사용한다.
+
+## 2. 방법 요약
+
+```
+p(y | x_0, D) ≈ Σ_{t=J}^{-K} π_t · p(y | x_t, w_t),    π_t = exp(-|t|/τ) / Σ_s exp(-|s|/τ)
+```
+
+- `p(y|x_t,w_t)`: 프레임 t에 대한 **softmax 확률** (logit 평균 아님). BNN이면 프레임마다 다른 dropout mask.
+- 기본값: K=5 (과거), J=0 (미래), τ=1.25. 원본 코드의 `l=0.8`은 `1/τ`.
+- VQ-DNN = dropout 없는 모델 + 동일 smoothing. 학습 변경 없음 (추론 전용).
+- 재귀형(README의 EMA): `q_0 = α p_0 + (1-α) q_{-1}`.
+
+재현 목표 (CamVid, U-Net): DNN NLL 0.314 / Acc 91.1 / ECE 4.31, BNN 0.276 / 91.8 / 3.71,
+VQ-DNN 0.284 / 91.2 / 3.00, VQ-BNN 0.253 / 92.0 / 2.24.
+
+## 3. 패키지 구조
+
+```
+Dockerfile, docker-compose.yml   # 모든 설치/실행은 컨테이너 안에서 (pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime)
+pyproject.toml
+temporal_smoothing/
+  __init__.py
+  smoothing.py
+  predictors.py
+  nn/
+    __init__.py
+    mc_dropout.py
+    blocks.py          # ConvBlock, DeconvBlock, TF 호환 초기화 (glorot_uniform, zero bias) / BN 설정
+    unet.py
+    segnet.py
+  data/
+    __init__.py
+    labels.py          # CamVid Label 테이블, color→index 매핑, memorized class weights
+    camvid.py
+    weights.py         # median frequency balancing
+    sequence.py        # SequenceWindowDataset
+    transforms.py
+  metrics/
+    __init__.py
+    segmentation.py
+    calibration.py     # ECE, confidence histogram, reliability diagram
+  engine/
+    __init__.py
+    train.py
+    evaluate.py
+scripts/
+  train_seg.py
+  eval_seg.py
+configs/
+  camvid_unet_bnn.yaml, camvid_unet_dnn.yaml, camvid_segnet_bnn.yaml ...
+tests/
+```
+
+텐서 레이아웃은 PyTorch 관례(NCHW, 시퀀스는 `[B, T, C, H, W]`, 시간축 오름차순 = 과거→미래)를 따른다.
+
+## 4. 모듈 설계
+
+### 4.1 `smoothing.py`
+
+```python
+def exp_decay_weights(past: int, future: int = 0, tau: float = 1.25, *, device=None, dtype=None) -> Tensor:
+    """shape [past + future + 1], 인덱스 past 가 현재 프레임. 합 = 1."""
+
+def smooth_categorical(probs: Tensor, weights: Tensor, dim: int = 1) -> Tensor:
+    """probs[..., T(dim), ...] 의 가중합. 확률 공간에서 평균."""
+
+def smooth_gaussian(mean: Tensor, var: Tensor, weights: Tensor, dim: int = 1) -> tuple[Tensor, Tensor]:
+    """혼합 분포 moment matching: E[μ], E[σ²] + Var[μ]."""
+
+class StreamSmoother:
+    """실시간용. 예측을 ring buffer(길이 K+1)에 캐시 → 프레임당 forward 1회.
+    update(pred) -> smoothed. 버퍼가 덜 찼을 때는 존재하는 프레임만으로 재정규화. reset()."""
+
+class EMASmoother:
+    """무한 EMA. alpha 또는 tau(alpha = 1 - exp(-1/τ))로 생성. update(pred) -> smoothed.
+    bias correction(누적 가중치로 정규화) 적용 → 무한 윈도우 StreamSmoother와 동일."""
+```
+
+- `StreamSmoother`/`EMASmoother`는 인과적(causal) 형태라 미래 프레임(J>0)은 지원하지 않는다. J>0은 윈도우 방식(`predict_vq`)으로 처리한다.
+- 두 smoother는 단순 가중평균이므로 확률뿐 아니라 임의 텐서(예: Gaussian mean)에도 쓸 수 있다.
+
+### 4.2 `predictors.py`
+
+모든 predictor는 `(model, xs) -> probs[B, num_classes, H, W]` 형태이고, 모델은 logit을 반환한다.
+
+| 함수 | 입력 | 설명 |
+|---|---|---|
+| `predict_dnn(model, x)` | `[B,C,H,W]` | softmax 1회 |
+| `predict_temp_scaling(model, x, temp)` | `[B,C,H,W]` | `softmax(logit / temp)` |
+| `predict_mc(model, x, n_samples)` | `[B,C,H,W]` | MC dropout N회 평균 (BNN) |
+| `predict_vq(model, xs, past, future, tau)` | `[B,T,C,H,W]` | `[B·T]`로 펼쳐 forward 1회 → softmax → `smooth_categorical` |
+| `predict_ensemble(models, x)` | `[B,C,H,W]` | 모델별 softmax 평균 |
+| `predict_ensemble_smoothing(models, xs, past, future, tau, generator=None, legacy=False)` | `[B,T,C,H,W]` | 프레임마다 무작위 모델 1개(배치 공유) → smoothing |
+
+- `predict_vq`의 배치화는 TF의 "프레임별 개별 forward"와 수학적으로 동일하다 (dropout mask는 샘플 단위로 독립). 메모리 한계용 `chunk_size` 옵션 제공.
+- 모든 predictor는 `@torch.no_grad()`, 호출 측에서 `model.eval()` 보장 (`MCDropout`은 eval에서도 활성).
+  배치화가 프레임별 forward와 동치인 것은 BN이 running stats를 쓸 때뿐이므로, train 모드 모델이 들어오면 `UserWarning`.
+
+### 4.3 `nn/`
+
+- `MCDropout(nn.Dropout)`: `forward`에서 항상 `F.dropout(x, p, training=True)`. `p=0`이면 identity → 같은 클래스로 DNN/BNN 표현. `set_mc_dropout(model, enabled=False)`이면 일반 dropout으로 돌아가 `model.training`을 따름 (BNN의 deterministic 근사 평가용).
+- `UNet(num_classes, in_channels=3, rate=0.0)` — 원본 그대로:
+  - ConvBlock = Conv3x3 → **ReLU → BN** (원본 순서)
+  - encoder 64-64 / 128-128 / 256×3 / 512×3 / 1024×3, MaxPool 2x2 `ceil_mode=True` (TF `SAME`)
+  - decoder: ConvTranspose 3x3 s2 → ReLU → BN, skip은 **덧셈**, 512×3 / 256×3 / 128×3 / 64×2, 1x1 conv head
+  - MCDropout 위치: block 3·4·5 (encoder, conv 후) / 6·7·8 (decoder) — 총 6개
+  - 업샘플 출력 크기는 `output_size=skip.shape[-2:]`로 지정 (홀수 해상도 대응)
+  - deconv는 bias 없음 (원본은 `tf.Variable` filter만 사용)
+  - TF `conv2d_transpose(SAME)` 정렬 재현: `ConvTranspose2d(padding=0)`로 전체 출력을 만든 뒤 앞쪽을 `pad_total // 2`만큼 crop.
+    PyTorch 관용 방식(`padding=1, output_padding=1`)은 1픽셀 어긋남. 테스트에서 SAME conv와의 adjoint 관계로 검증.
+- `SegNet(num_classes, in_channels=3, rate=0.0)` — 원본 그대로:
+  - ConvBlock = Conv3x3 → BN → ReLU
+  - `MaxPool2d(2, 2, ceil_mode=True, return_indices=True)` + `MaxUnpool2d(output_size=...)`
+  - MCDropout 위치: pool3·pool4 후, block 5·6·7·8 후 — 총 6개
+- TF 호환 기본값: Conv/ConvTranspose `xavier_uniform_` + zero bias, `BatchNorm2d(eps=1e-3, momentum=0.01)`. `tf_compat_init=False`로 PyTorch 기본값 사용 가능.
+- TF 체크포인트가 공개되지 않았으므로 weight 변환기는 만들지 않는다. 목표는 지표 재현이다.
+
+### 4.4 `data/`
+
+데이터셋은 CamVid만 지원한다 (Cityscapes는 범위 밖). 시퀀스 윈도우는 데이터셋과 무관하게 구현해 확장 가능하게 둔다.
+
+- 디렉터리 (SegNet/Kaggle 701장 배포판): `root/{train,val,test}{,_labels}/`, 라벨은 `{seq}_{frame}_L.png` RGB 컬러.
+  train 369 / val 100 / test 232. 프레임 번호는 `006690` 또는 `f05100` 형식 (`parse_camvid_name`).
+- `labels.py`: 원본 `camvid_labels` 테이블 이식. `color_map(name) -> dict[rgb, index]`
+  - `camvid` / `camvid-11`: category 기준 11 클래스 (index = categoryId - 1), `camvid-31`: void 제외 원 라벨 31개 (테이블 순서)
+  - 테이블에 없는 색 (Void, 압축 노이즈 ~200픽셀) → `-1`
+- 전처리 (원본 일치): RGB 로드 → `nearest-exact` 리사이즈 360×480 (TF2 `resize(NEAREST)`와 같은 픽셀 중심 샘플링) → `/255` (정규화 없음).
+  컬러 라벨은 리사이즈 후 index로 변환. 학습 augmentation: `random_crop_flip` (원본 CamVid 기본은 둘 다 사실상 없음).
+- `CamVid(root, split, name, size, crop_size, flip)`: `(image[3,H,W] float, label[H,W] long)`.
+- `SequenceWindowDataset(frames, labels, load_frame, load_label, past, future, boundary)`:
+  - 라벨 프레임마다 `(frames[T,3,H,W], label[H,W])`. 이웃은 시퀀스 내 정렬된 프레임 목록의 위치 기준.
+  - 시퀀스 경계: `boundary="clamp"`(가장자리 프레임 반복, 기본) / `"skip"` / `"legacy"`(원본처럼 전체 파일 목록 기준, 시퀀스 무시).
+  - 라벨 프레임이 프레임 목록에 없으면 건너뛰고 경고.
+- `camvid_sequence(root, seq_dir=root/seq, ...)`: test 라벨 + 연속 프레임 디렉터리로 `SequenceWindowDataset` 생성.
+- class weights: 원본 memorized 값(`memorized_class_weights`)이 기본. `median_frequency_weights`로 직접 계산 가능.
+  실제 CamVid train에서 계산한 값은 memorized와 클래스 순위·median 클래스(Car)는 같지만 값이 5~20% 다르다
+  (train/val/test 어느 조합과도 정확히 일치하지 않음 → 원본은 다른 데이터 버전에서 계산된 것으로 추정).
+- 데이터 마운트: `.env`의 `DATA_ROOT`를 컨테이너 `/data`로 마운트, `CAMVID_ROOT=/data/CamVid`. 실데이터 테스트는 경로가 없으면 skip.
+
+#### 연속 프레임 (VQ 평가용)
+
+701장 배포판에는 30Hz 연속 프레임이 없다. 원본 영상에서 추출해야 한다.
+
+| 시퀀스 | 영상 | test 라벨 프레임 범위 | 오프셋 (영상 index = 프레임 번호 − 오프셋) | 라벨 사진 검증 |
+|---|---|---|---|---|
+| 0001TP | `01TP_extract.avi` (Lagarith 무손실, 30 fps) | 6690 – 10260 | 6660 (30프레임 pre-roll) | 124/124, 차이 0.00 |
+| 0006R0 | `0006R0.MXF` (DVCPRO HD, 29.97 fps) | 990 – 3780 | −1 | 101/101, 차이 ≤ 1.09 |
+| 0016E5 | `0016E5.zip.001/.002` → `0016E5.MXF` | 420 – 8580 (일부 15 Hz) | −1 | 305/305, 차이 ≤ 0.94 |
+| Seq05VD | `0005VD.MXF` | 240 – 5070 | −1 | 171/171, 차이 ≤ 0.95 |
+
+- 출처: http://vis.cs.ucl.ac.uk/Download/G.Brostow/CamVid/ (원 공식 FTP는 접속 불가). md5 검증 (`01TP_extract.avi`는 md5 목록에 없음).
+- `scripts/prepare_camvid_seq.py`: 첫 라벨 사진과 영상 앞부분을 픽셀 비교해 오프셋을 찾고, train/val/test 라벨 사진 701장 전부로 검증한다.
+  정답 프레임이 ±1 이웃 프레임보다 더 가까운지도 확인 (이웃과의 평균 차이 5~16 vs 정답 ≤ 1.1 → off-by-one 없음).
+  차이는 평균 절대 픽셀 차 (0–255). MXF의 잔여 차이 ~1은 YUV→RGB 변환 차이.
+- ffmpeg는 `-vsync 0`으로 프레임 복제/누락 없이 디코딩.
+- 기본 추출 범위: test 라벨마다 과거 5 + 현재 + 미래 2 프레임 → `CamVid/seq/` 1,760장 (960×720 PNG, 1.3 GB).
+
+### 4.5 `metrics/`
+
+- `SegmentationMeter(num_classes, cutoffs=(0.9,), n_bins=10, legacy=False)`:
+  - `nll, acc, iou, class_iou, ece`는 전체 유효 픽셀 기준. cutoff별 지표는 `acc_90`처럼 접미사(`round(c*100)`)로 반환.
+  - 누적은 입력 텐서의 device에서 `bincount`로 수행 (GPU 평가 시 CPU 왕복 없음), 비율 계산은 float64.
+  - 원본 TF 지표 함수를 numpy로 옮긴 기준 구현과 테스트에서 일치 확인 (legacy / 기본 모드 모두).
+  - `update(probs, target, mask=None)`, `compute() -> dict`
+  - NLL: 마스킹된 픽셀 평균 `-log(clamp(p_y, 1e-7))` (Keras와 같은 clip)
+  - cutoff별 certain/uncertain confusion matrix → Acc, mIoU(GT에 존재하는 클래스만 평균), Unc = p(unconfident | inaccurate), Freq(Cov) = p(confident)
+  - 결과 키: `nll, acc, iou, class_iou, ece, acc_90, iou_90, unc_90, freq_90`; 구간 정보는 `meter.bins() -> {edges, count, acc, conf}`
+- ECE: 10 bin. 기본은 count/acc/conf 모두 `(lo, hi]` 경계(첫 bin은 0 포함). `legacy=True`면 원본의 불일치 경계(cm `(lo,hi]`, conf `[lo,hi)`)를 재현한다.
+- edge mask (Sobel 크기 > edge) 옵션 이식. 시퀀스 입력이면 현재 프레임(`index=past`) 기준이다. 원본의 `xs[:, -1]`은 J>0일 때 틀리므로 수정한다.
+- `plot_calibration(bins) -> Figure` (confidence histogram + reliability diagram).
+
+### 4.6 `engine/` & `scripts/`
+
+- `engine/config.py`: `Config(data, model, train, eval, output_dir)` dataclass. YAML 로드 + `key.path=value` override (값은 YAML로 파싱).
+- `segmentation_loss(logits, target, class_weights, reduction)`: 픽셀별 CE × 정답 클래스 weight, void(-1) 제외.
+  `"mean"` = 유효 픽셀 수로 나눔 (기본), `"sum"` = 원본 gradient와 동일. PyTorch weighted CE의 `mean`(weight 합으로 나눔)과 다르므로 직접 구현.
+- `train_one_epoch` / `fit`: Adam, `model.train()` (BN 학습 모드, MCDropout 항상 on), non-finite loss면 중단.
+  `eval_every` epoch마다 val stills에 MC `eval_samples`회 평가 (원본: 5 epoch마다 MC 5회).
+  `output_dir`에 `config.json`, `metrics.jsonl`(epoch별), `last.pt`(매 epoch, `--resume`), `model.pt`(최종) 저장.
+- `evaluate(predictor, loader, ...)`: test 라벨 프레임 윈도우 `[B,T,3,H,W]` 하나로 모든 방법 평가.
+  단일 프레임 방법(dnn, temp, mc, ensemble)은 현재 프레임 `frames[:, past]` 사용 (원본 노트북도 seq 프레임으로 평가).
+  타이밍은 predictor만 측정 (CUDA synchronize, 첫 배치 warm-up 제외), `time_ms`와 `throughput`(labeled frames/s).
+- 방법: `dnn`, `temp`, `mc`, `vq`, `ensemble`, `ensemble_vq` (`ensemble*`은 `--ckpt` 여러 개).
+- 기본 하이퍼파라미터: Adam(lr 1e-3, β=(0.9, 0.999)), batch 3, CamVid 100 epoch, rate 0.5, class weights memorized,
+  MC 30 samples, K=5, J=0, τ=1.25, cutoffs (0.7, 0.9).
+- `configs/camvid_{unet,segnet}_{bnn,dnn}.yaml`.
+- 실측 (RTX 4070 Laptop 8GB, U-Net, 360×480): 학습 ~41 s/epoch (100 epoch ≈ 70분).
+- 참고: TF 호환 BN momentum(0.01)에서는 학습 초반 running stats가 가중치 변화를 따라가지 못해 eval 모드 성능이 크게 낮다
+  (2 epoch: running stats NLL 8.4 vs batch stats 1.07). 원본과 같은 동작이며 학습이 진행되면 해소될 것으로 예상.
+- 윈도우 평가의 `vq` 처리량은 프레임마다 과거 K프레임을 다시 forward하므로 DNN보다 훨씬 낮다 (원본 TF도 동일).
+  논문의 처리량 주장(VQ-BNN ≈ DNN)은 예측을 캐시하는 스트리밍(`StreamSmoother`) 기준이므로, 처리량 비교는 별도 스트리밍 벤치마크로 측정한다.
+
+## 5. 원본 코드와의 차이 (legacy 플래그)
+
+| 항목 | 원본 동작 | 기본 동작 | 호환 |
+|---|---|---|---|
+| ECE bin 경계 | cm `(lo,hi]`, conf `[lo,hi)` 불일치 | 둘 다 `(lo,hi]` | `legacy=True` |
+| 시퀀스 윈도우 | 평탄화된 파일 리스트에서 슬라이딩 → 시퀀스 경계 넘음 | 시퀀스 내부로 제한 (clamp) | `boundary="legacy"` |
+| ensemble smoothing 모델 선택 | `randint(0,n)-1` → 마지막 모델 2배 확률 | 균등 | `legacy=True` |
+| edge mask (seq) | `xs[:, -1]` (J>0이면 미래 프레임) | 현재 프레임 | `legacy=True` |
+| loss reduction | 픽셀 벡터 gradient = sum | mean | `loss_reduction="sum"` |
+| VQ 평가 forward | 프레임별 개별 호출 | `[B·T]` 배치 1회 (동치) | — |
+
+## 6. 테스트 계획 (pytest)
+
+- `exp_decay_weights`: 합 1, 인접 비율 `e^{1/τ}`, TF 수식(`range(K) + range(K, K-J-1, -1)`)과 일치.
+- `StreamSmoother` 결과 == `predict_vq` 윈도우 결과 (DNN 모델, 버퍼가 찬 이후).
+- `MCDropout`: `model.eval()`에서도 두 번의 forward 결과가 다름. `p=0`이면 같음.
+- UNet/SegNet: 홀수 해상도(예: 360×480 → 45×60 → 23×30) 입출력 shape 일치.
+- `SegmentationMeter`: 작은 수작업 예제와 numpy 기준 구현(원본 함수 이식)으로 Acc/mIoU/Unc/Freq/ECE 검증. legacy 모드 차이 확인.
+- `SequenceWindowDataset`: 경계 clamp/skip 동작, 라벨 프레임 인덱스 정렬.
+
+## 7. 구현 순서
+
+1. `pyproject.toml`, 패키지 골격, `smoothing.py` + 테스트
+2. `nn/` (MCDropout, UNet, SegNet) + shape 테스트
+3. `predictors.py` + 테스트
+4. `metrics/` + numpy 기준 테스트
+5. `data/` (labels, CamVid, SequenceWindowDataset), 연속 프레임 추출
+6. `engine/`, `scripts/`, configs
+7. README (설치·데이터 준비·사용법), CamVid 재현 실험
+8. (추후) depth estimation, Gaussian smoothing 경로
+
+## 8. 재현 결과 요약
+
+전체 표는 README의 Results 참고 (CamVid-11 test, 시드 1개, RTX 4070 Laptop).
+
+- U-Net VQ-BNN: NLL 0.293 / Acc 91.1 / Acc-90 97.1 / Unc-90 73.3 / ECE 2.47, 스트리밍 30.6 fps
+  (논문 0.253 / 92.0 / 97.4 / 72.4 / 2.24). MC 30회 BNN(0.312, ECE 3.85, 1.1 fps)보다 모든 지표가 좋고 ~29배 빠르다.
+- 4개 모델 모두에서 smoothing이 단일 forward 대비 NLL, ECE, Acc-90, Unc-90을 개선. 스트리밍 처리량은 DNN의 96~97%.
+- 논문과의 차이: U-Net NLL이 0.03~0.04 높음. 학습 중 val 지표가 크게 출렁임 (예: val NLL 0.22 → 0.87 → 0.22) —
+  batch 3 + Keras BN momentum 조합으로 추정. 최종 epoch 체크포인트를 그대로 사용.
+- SegNet(원본처럼 사전학습 없이 학습)은 test에서 약함 (Acc 80~84%, val은 86~89%).

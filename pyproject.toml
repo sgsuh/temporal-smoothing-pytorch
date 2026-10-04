@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "temporal-smoothing"
+version = "0.1.0"
+description = "PyTorch implementation of VQ-BNN temporal smoothing for data streams (arXiv:1907.05911)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "pillow",
+    "matplotlib",
+    "tqdm",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["temporal_smoothing*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
