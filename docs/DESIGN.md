@@ -107,10 +107,11 @@ class EMASmoother:
 | `predict_mc(model, x, n_samples)` | `[B,C,H,W]` | MC dropout N회 평균 (BNN) |
 | `predict_vq(model, xs, past, future, tau)` | `[B,T,C,H,W]` | `[B·T]`로 펼쳐 forward 1회 → softmax → `smooth_categorical` |
 | `predict_ensemble(models, x)` | `[B,C,H,W]` | 모델별 softmax 평균 |
-| `predict_ensemble_smoothing(models, xs, past, future, tau, generator=None)` | `[B,T,C,H,W]` | 프레임마다 무작위 모델 1개 → smoothing |
+| `predict_ensemble_smoothing(models, xs, past, future, tau, generator=None, legacy=False)` | `[B,T,C,H,W]` | 프레임마다 무작위 모델 1개(배치 공유) → smoothing |
 
 - `predict_vq`의 배치화는 TF의 "프레임별 개별 forward"와 수학적으로 동일하다 (dropout mask는 샘플 단위로 독립). 메모리 한계용 `chunk_size` 옵션 제공.
 - 모든 predictor는 `@torch.no_grad()`, 호출 측에서 `model.eval()` 보장 (`MCDropout`은 eval에서도 활성).
+  배치화가 프레임별 forward와 동치인 것은 BN이 running stats를 쓸 때뿐이므로, train 모드 모델이 들어오면 `UserWarning`.
 
 ### 4.3 `nn/`
 
