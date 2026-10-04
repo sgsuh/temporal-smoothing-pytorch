@@ -42,7 +42,7 @@ temporal_smoothing/
   nn/
     __init__.py
     mc_dropout.py
-    init.py            # TF 호환 초기화 (glorot_uniform, zero bias)
+    blocks.py          # ConvBlock, DeconvBlock, TF 호환 초기화 (glorot_uniform, zero bias) / BN 설정
     unet.py
     segnet.py
   data/
@@ -114,13 +114,16 @@ class EMASmoother:
 
 ### 4.3 `nn/`
 
-- `MCDropout(nn.Dropout)`: `forward`에서 항상 `F.dropout(x, p, training=True)`. `p=0`이면 identity → 같은 클래스로 DNN/BNN 표현. `set_mc_dropout(model, enabled)` 유틸로 일괄 on/off 가능.
+- `MCDropout(nn.Dropout)`: `forward`에서 항상 `F.dropout(x, p, training=True)`. `p=0`이면 identity → 같은 클래스로 DNN/BNN 표현. `set_mc_dropout(model, enabled=False)`이면 일반 dropout으로 돌아가 `model.training`을 따름 (BNN의 deterministic 근사 평가용).
 - `UNet(num_classes, in_channels=3, rate=0.0)` — 원본 그대로:
   - ConvBlock = Conv3x3 → **ReLU → BN** (원본 순서)
   - encoder 64-64 / 128-128 / 256×3 / 512×3 / 1024×3, MaxPool 2x2 `ceil_mode=True` (TF `SAME`)
   - decoder: ConvTranspose 3x3 s2 → ReLU → BN, skip은 **덧셈**, 512×3 / 256×3 / 128×3 / 64×2, 1x1 conv head
   - MCDropout 위치: block 3·4·5 (encoder, conv 후) / 6·7·8 (decoder) — 총 6개
   - 업샘플 출력 크기는 `output_size=skip.shape[-2:]`로 지정 (홀수 해상도 대응)
+  - deconv는 bias 없음 (원본은 `tf.Variable` filter만 사용)
+  - TF `conv2d_transpose(SAME)` 정렬 재현: `ConvTranspose2d(padding=0)`로 전체 출력을 만든 뒤 앞쪽을 `pad_total // 2`만큼 crop.
+    PyTorch 관용 방식(`padding=1, output_padding=1`)은 1픽셀 어긋남. 테스트에서 SAME conv와의 adjoint 관계로 검증.
 - `SegNet(num_classes, in_channels=3, rate=0.0)` — 원본 그대로:
   - ConvBlock = Conv3x3 → BN → ReLU
   - `MaxPool2d(2, 2, ceil_mode=True, return_indices=True)` + `MaxUnpool2d(output_size=...)`
