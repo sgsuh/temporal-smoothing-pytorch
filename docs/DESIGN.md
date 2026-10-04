@@ -148,11 +148,14 @@ class EMASmoother:
 
 ### 4.5 `metrics/`
 
-- `SegmentationMeter(num_classes, cutoffs=(0.0, 0.9), n_bins=10, legacy=False)`:
+- `SegmentationMeter(num_classes, cutoffs=(0.9,), n_bins=10, legacy=False)`:
+  - `nll, acc, iou, class_iou, ece`는 전체 유효 픽셀 기준. cutoff별 지표는 `acc_90`처럼 접미사(`round(c*100)`)로 반환.
+  - 누적은 입력 텐서의 device에서 `bincount`로 수행 (GPU 평가 시 CPU 왕복 없음), 비율 계산은 float64.
+  - 원본 TF 지표 함수를 numpy로 옮긴 기준 구현과 테스트에서 일치 확인 (legacy / 기본 모드 모두).
   - `update(probs, target, mask=None)`, `compute() -> dict`
   - NLL: 마스킹된 픽셀 평균 `-log(clamp(p_y, 1e-7))` (Keras와 같은 clip)
   - cutoff별 certain/uncertain confusion matrix → Acc, mIoU(GT에 존재하는 클래스만 평균), Unc = p(unconfident | inaccurate), Freq(Cov) = p(confident)
-  - 결과 키: `nll, acc, acc_90, iou, iou_90, unc_90, freq_90, ece, bins{count, acc, conf}`
+  - 결과 키: `nll, acc, iou, class_iou, ece, acc_90, iou_90, unc_90, freq_90`; 구간 정보는 `meter.bins() -> {edges, count, acc, conf}`
 - ECE: 10 bin. 기본은 count/acc/conf 모두 `(lo, hi]` 경계(첫 bin은 0 포함). `legacy=True`면 원본의 불일치 경계(cm `(lo,hi]`, conf `[lo,hi)`)를 재현한다.
 - edge mask (Sobel 크기 > edge) 옵션 이식. 시퀀스 입력이면 현재 프레임(`index=past`) 기준이다. 원본의 `xs[:, -1]`은 J>0일 때 틀리므로 수정한다.
 - `plot_calibration(bins) -> Figure` (confidence histogram + reliability diagram).
