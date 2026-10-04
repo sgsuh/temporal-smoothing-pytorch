@@ -31,6 +31,16 @@ Download the original videos from the [CamVid mirror](http://vis.cs.ucl.ac.uk/Do
 docker compose run --rm dev python scripts/prepare_camvid_seq.py --past 5 --future 2
 ```
 
+## Training and evaluation
+
+```bash
+docker compose run --rm dev python scripts/train_seg.py --config configs/camvid_unet_bnn.yaml
+docker compose run --rm dev python scripts/eval_seg.py --config configs/camvid_unet_bnn.yaml \
+    --ckpt runs/camvid_unet_bnn/model.pt --methods dnn mc vq
+```
+
+Config values can be overridden with `--set key.path=value`, e.g. `--set train.epochs=10 eval.future=1`.
+
 ## Usage
 
 ```python

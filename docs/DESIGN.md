@@ -188,15 +188,24 @@ class EMASmoother:
 
 ### 4.6 `engine/` & `scripts/`
 
-- `train_one_epoch(model, loader, optimizer, class_weights, loss_reduction="mean")`:
-  - weighted CE, `ignore_index=-1`. 원본은 사실상 `sum`이고 Adam은 스케일에 거의 불변이므로 기본은 `mean`, `"sum"` 옵션을 둔다.
-  - `model.train()` (BN 학습 모드, MCDropout 항상 on).
-- class weights: 기본은 memorized median-frequency 값, 옵션으로 `median_frequency_weights(dataset)`.
-- `evaluate(predictor, loader, meter)` + 추론 시간 측정. CUDA면 `synchronize` 후 측정한다.
-- 기본 하이퍼파라미터: Adam(lr 1e-3, β=(0.9, 0.999)), batch 3, CamVid 100 epoch, rate 0.5, MC 30 samples, K=5, J=0, τ=1.25.
-- `scripts/train_seg.py --config configs/camvid_unet_bnn.yaml`, `scripts/eval_seg.py --config ... --ckpt ... --method {dnn,mc,vq,temp,ensemble,ensemble_vq}`
-- 설정은 yaml → dataclass. CLI 인자로 덮어쓸 수 있다. 로깅은 TensorBoard(선택) + stdout.
-- 재현성: `seed` 설정, `torch.Generator` 전달.
+- `engine/config.py`: `Config(data, model, train, eval, output_dir)` dataclass. YAML 로드 + `key.path=value` override (값은 YAML로 파싱).
+- `segmentation_loss(logits, target, class_weights, reduction)`: 픽셀별 CE × 정답 클래스 weight, void(-1) 제외.
+  `"mean"` = 유효 픽셀 수로 나눔 (기본), `"sum"` = 원본 gradient와 동일. PyTorch weighted CE의 `mean`(weight 합으로 나눔)과 다르므로 직접 구현.
+- `train_one_epoch` / `fit`: Adam, `model.train()` (BN 학습 모드, MCDropout 항상 on), non-finite loss면 중단.
+  `eval_every` epoch마다 val stills에 MC `eval_samples`회 평가 (원본: 5 epoch마다 MC 5회).
+  `output_dir`에 `config.json`, `metrics.jsonl`(epoch별), `last.pt`(매 epoch, `--resume`), `model.pt`(최종) 저장.
+- `evaluate(predictor, loader, ...)`: test 라벨 프레임 윈도우 `[B,T,3,H,W]` 하나로 모든 방법 평가.
+  단일 프레임 방법(dnn, temp, mc, ensemble)은 현재 프레임 `frames[:, past]` 사용 (원본 노트북도 seq 프레임으로 평가).
+  타이밍은 predictor만 측정 (CUDA synchronize, 첫 배치 warm-up 제외), `time_ms`와 `throughput`(labeled frames/s).
+- 방법: `dnn`, `temp`, `mc`, `vq`, `ensemble`, `ensemble_vq` (`ensemble*`은 `--ckpt` 여러 개).
+- 기본 하이퍼파라미터: Adam(lr 1e-3, β=(0.9, 0.999)), batch 3, CamVid 100 epoch, rate 0.5, class weights memorized,
+  MC 30 samples, K=5, J=0, τ=1.25, cutoffs (0.7, 0.9).
+- `configs/camvid_{unet,segnet}_{bnn,dnn}.yaml`.
+- 실측 (RTX 4070 Laptop 8GB, U-Net, 360×480): 학습 ~41 s/epoch (100 epoch ≈ 70분).
+- 참고: TF 호환 BN momentum(0.01)에서는 학습 초반 running stats가 가중치 변화를 따라가지 못해 eval 모드 성능이 크게 낮다
+  (2 epoch: running stats NLL 8.4 vs batch stats 1.07). 원본과 같은 동작이며 학습이 진행되면 해소될 것으로 예상.
+- 윈도우 평가의 `vq` 처리량은 프레임마다 과거 K프레임을 다시 forward하므로 DNN보다 훨씬 낮다 (원본 TF도 동일).
+  논문의 처리량 주장(VQ-BNN ≈ DNN)은 예측을 캐시하는 스트리밍(`StreamSmoother`) 기준이므로, 처리량 비교는 별도 스트리밍 벤치마크로 측정한다.
 
 ## 5. 원본 코드와의 차이 (legacy 플래그)
 

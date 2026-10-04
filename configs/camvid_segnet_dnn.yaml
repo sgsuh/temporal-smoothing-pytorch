@@ -1,0 +1,34 @@
+# CamVid-11, deterministic segnet, official training setup.
+output_dir: runs/camvid_segnet_dnn
+
+data:
+  root: /data/CamVid
+  name: camvid-11
+  size: [360, 480]
+  crop_size: null
+  flip: false
+  num_workers: 4
+
+model:
+  arch: segnet
+  rate: 0.0
+
+train:
+  epochs: 100
+  batch_size: 3
+  lr: 1.0e-3
+  betas: [0.9, 0.999]
+  class_weights: memorized
+  loss_reduction: mean
+  eval_every: 5
+  eval_samples: 5
+  seed: 0
+
+eval:
+  methods: [dnn, vq]
+  batch_size: 3
+  mc_samples: 30
+  past: 5
+  future: 0
+  tau: 1.25
+  cutoffs: [0.7, 0.9]
